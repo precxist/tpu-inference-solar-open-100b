@@ -228,10 +228,39 @@ def _apply_yarn_rope(x_TNH: jax.Array, positions: jax.Array, head_dim: int,
 # KV-load latency dominates per-block compute; Solar's longer-context
 # / larger-block regime saturates the pipe with double-buffering.
 #
-# Prefill block (bq=128, bkv=512, bs=2, nb=2): not grid-searched because
-# this workload is throughput-dominated (4k/1k) and prefill is a small
-# fraction of step time; the values are inherited from the original
-# Option A config and have not regressed.
+# Prefill block sweep (single 4k-token request, --batch-size 1
+# --output-len 1 isolating one prefill step; latency is the wall-clock
+# time of one such step):
+#
+#   bq    bkv    nb   prefill_lat   verdict
+#   ----  -----  --   -----------   -------
+#    128   512    2     0.1735s     starting point (Option A inherited)
+#    256   512    2     0.1646s     -5% — Phase A WINNER
+#    512   512    2     0.1723s     near-baseline regression
+#    256  1024    2     0.1640s     -0.4% vs Phase A — Phase B WINNER
+#    256  2048    2     0.1820s     worse than baseline (vmem pressure)
+#    256  1024    3     0.1650s     ≈ Phase B winner; tps marginally up
+#                                   but latency slightly higher and the
+#                                   extra buffer just spends VMEM
+#
+# Final winner: bq=256, bkv=1024, bs=2, nb=2 (~5.5% over starting point).
+#
+# Why bq=256 wins over 128 and 512: 4k prefill / bq=128 → 32 inner
+# iterations vs 16 at bq=256, and the per-block MXU utilisation is the
+# same — fewer launches with the same compute is a clean win. bq=512
+# doubles the per-block (q × num_q_heads × head_dim) activation; with
+# Solar's wide hidden_size and the YaRN RoPE constants riding along,
+# vmem/register pressure outweighs the extra amortisation.
+#
+# Why bkv=1024 helps marginally and bkv=2048 regresses: bkv=1024 reads
+# 4 pages per block (page_size=256), still within vmem; bkv=2048 reads
+# 8 and either spills or pushes the kernel onto a slower codepath.
+#
+# Note: kernel batch_size=2 was NOT exercised by the bs=1 profile (only
+# 1 prefill seq present per step), so the value is inherited unchanged
+# from Option A. If the engine packs concurrent prefill chunks under
+# real load, batch_size could matter — re-tune via TTFT benchmark
+# rather than this single-seq profile if it becomes a hotspot.
 # ---------------------------------------------------------------------------
 # Decode (steady-state batched serving): each request contributes 1 query
 # token. The kernel processes ``batch_size`` sequences per invocation.
@@ -243,8 +272,8 @@ _SOLAR_DECODE_BLOCKS = solar_brpa_configs.BlockSizes(
 )
 # Prefill / chunked prefill: queries can be hundreds of tokens long.
 _SOLAR_PREFILL_BLOCKS = solar_brpa_configs.BlockSizes(
-    bq_sz=128,
-    bkv_sz=512,
+    bq_sz=256,
+    bkv_sz=1024,
     batch_size=2,
     n_buffer=2,
 )
